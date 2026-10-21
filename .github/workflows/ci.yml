@@ -30,6 +30,11 @@ on:
                 required: false
                 type: string
                 default: manual
+            report_url:
+                description: Where the statuses link (the private run that keeps the logs); empty links to this run
+                required: false
+                type: string
+                default: ''
             all_areas:
                 description: Validate every area and run the end-to-end suite
                 type: boolean
@@ -808,7 +813,7 @@ jobs:
                   GH_TOKEN: ${{ steps.private.outputs.token }}
                   SOURCE_SHA: ${{ inputs.source_sha }}
                   PRIVATE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
-                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+                  RUN_URL: ${{ inputs.report_url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
               run: |
                   set -euo pipefail
                   [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_sha must be a full commit SHA' >&2; exit 1; }
