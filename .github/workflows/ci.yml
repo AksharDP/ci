@@ -1,0 +1,831 @@
+name: CI
+
+# Runs the private repository's checks and reports the results back to it. This repository holds
+# workflow definitions only. Each job checks out the private source at source_sha with a read-only
+# GitHub App token, then runs the private repository's own scripts and composite actions from there.
+#
+# Keep it dispatch-only. A pull_request trigger would let forks run here and restore caches, and
+# nothing here would gate that. Runs start from the private repository's ci-dispatch workflow or by
+# hand with a source_sha input. Setup: docs/runbooks/public-ci.md in the private repository.
+
+on:
+    workflow_dispatch:
+        inputs:
+            mode:
+                description: ci validates and reports statuses; deps builds the dependency images for a release
+                type: choice
+                options: [ci, deps]
+                default: ci
+            source_sha:
+                description: Full commit SHA in the private repository
+                required: true
+                type: string
+            source_ref_key:
+                description: Short hash of the source branch; a newer run on the same branch cancels older ones
+                required: false
+                type: string
+                default: manual
+            request_id:
+                description: Names the run for the caller to find (its title is CI <request_id>)
+                required: false
+                type: string
+                default: manual
+            all_areas:
+                description: Validate every area and run the end-to-end suite
+                type: boolean
+                default: false
+            coverage:
+                description: Add a coverage summary to validation
+                type: boolean
+                default: false
+            real_services:
+                description: Run the PostgreSQL and Valkey integration tests and the storage suite
+                type: boolean
+                default: false
+            scale_benchmark:
+                description: Run the PostgreSQL workload benchmark (full-1m can exceed the six-hour job limit)
+                type: choice
+                options: [none, smoke, full-1m]
+                default: none
+            benchmark_profile:
+                type: choice
+                options: [all, small, typical, large, xlarge, stress]
+                default: all
+            benchmark_area:
+                type: choice
+                options: [all, drive, search, stats, shares]
+                default: all
+            benchmark_iterations:
+                type: choice
+                options: ['1', '5', '20']
+                default: '5'
+            benchmark_write_rows:
+                type: choice
+                options: ['0', '10000', '100000']
+                default: '0'
+            benchmark_filenames:
+                type: choice
+                options: [synthetic, mixed-32]
+                default: synthetic
+            benchmark_derivative_percent:
+                type: choice
+                options: ['0', '25', '50', '100']
+                default: '25'
+
+run-name: CI ${{ inputs.request_id }}
+
+concurrency:
+    group: ${{ inputs.mode }}-${{ inputs.source_ref_key }}
+    cancel-in-progress: ${{ inputs.mode == 'ci' }}
+
+permissions: {}
+
+jobs:
+    plan:
+        if: inputs.mode == 'ci'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 15
+        permissions:
+            contents: read
+        outputs:
+            RUN_VALIDATION: ${{ steps.areas.outputs.RUN_VALIDATION }}
+            API_CHANGED: ${{ steps.areas.outputs.API_CHANGED }}
+            DB_CHANGED: ${{ steps.areas.outputs.DB_CHANGED }}
+            WEB_CHANGED: ${{ steps.areas.outputs.WEB_CHANGED }}
+            WORKER_CHANGED: ${{ steps.areas.outputs.WORKER_CHANGED }}
+            BACKGROUND_WORKER_CHANGED: ${{ steps.areas.outputs.BACKGROUND_WORKER_CHANGED }}
+            ROOT_CHANGED: ${{ steps.areas.outputs.ROOT_CHANGED }}
+            E2E_CHANGED: ${{ steps.areas.outputs.E2E_CHANGED }}
+            BACKEND_BUILD_CHANGED: ${{ steps.areas.outputs.BACKEND_BUILD_CHANGED }}
+            INSTALL_FILTERS: ${{ steps.filters.outputs.INSTALL_FILTERS }}
+        steps:
+            - name: Check the source SHA
+              shell: bash
+              env:
+                  SOURCE_SHA: ${{ inputs.source_sha }}
+              run: |
+                  set -euo pipefail
+                  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_sha must be a full commit SHA' >&2; exit 1; }
+
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  fetch-depth: 0
+
+            - name: Set up Bun
+              uses: ./.github/actions/setup-bun
+
+            - name: Detect changed areas
+              id: areas
+              shell: bash
+              env:
+                  ALL_AREAS: ${{ inputs.all_areas }}
+              run: |
+                  set -euo pipefail
+                  # The area filters diff against origin/main, which the checkout does not fetch.
+                  git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+                  if [[ "$ALL_AREAS" == true ]]; then
+                      bun tools/ci/changed-areas.mjs --all > "$RUNNER_TEMP/areas.env"
+                  else
+                      bun tools/ci/changed-areas.mjs > "$RUNNER_TEMP/areas.env"
+                  fi
+                  sed 's/^export //' "$RUNNER_TEMP/areas.env" >> "$GITHUB_OUTPUT"
+
+            - name: Choose the dependency profile
+              id: filters
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  source "$RUNNER_TEMP/areas.env"
+                  filters=''
+                  if [[ "$RUN_VALIDATION" == true ]]; then
+                      if [[ "$ROOT_CHANGED" == true ]]; then
+                          filters='[]'
+                      else
+                          selected=()
+                          [[ "$API_CHANGED" != true ]] || selected+=('@filecube/api')
+                          [[ "$DB_CHANGED" != true ]] || selected+=('@filecube/db')
+                          [[ "$WEB_CHANGED" != true ]] || selected+=('@filecube/web')
+                          [[ "$WORKER_CHANGED" != true ]] || selected+=('@filecube/worker')
+                          [[ "$BACKGROUND_WORKER_CHANGED" != true ]] || selected+=('@filecube/background-worker')
+                          selected+=(filecube)
+                          filters="$(printf '%s\n' "${selected[@]}" | jq -Rsc 'split("\n")[:-1]')"
+                      fi
+                  elif [[ "$BACKEND_BUILD_CHANGED" == true ]]; then
+                      filters='["filecube"]'
+                  fi
+                  echo "INSTALL_FILTERS=${filters}" >> "$GITHUB_OUTPUT"
+
+    # Reports the status `Required validation`. The private repository's branch protection and its
+    # release gate match that name, so keep it.
+    validate:
+        name: Required validation
+        needs: plan
+        if: inputs.mode == 'ci'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 60
+        permissions:
+            contents: read
+        env:
+            FILECUBE_TEST_COVERAGE: ${{ inputs.coverage }}
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  fetch-depth: 0
+
+            - name: Set up Bun and the selected dependencies
+              uses: ./.github/actions/setup-bun
+              with:
+                  install-filters: ${{ needs.plan.outputs.INSTALL_FILTERS }}
+
+            - name: Key the caches
+              id: keys
+              shell: bash
+              env:
+                  RUN_VALIDATION: ${{ needs.plan.outputs.RUN_VALIDATION }}
+              run: |
+                  set -euo pipefail
+                  echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+                  echo "validating=${RUN_VALIDATION}" >> "$GITHUB_OUTPUT"
+
+            # Caches saved on skipped runs carry a different key, so a validating run never restores an empty one.
+            - name: Restore the TypeScript build info
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ runner.temp }}/tsbuild-cache
+                  key: tsbuild-v2-${{ runner.arch }}-${{ steps.keys.outputs.validating }}-${{ hashFiles('bun.lock') }}-${{ steps.keys.outputs.day }}
+                  restore-keys: |
+                      tsbuild-v2-${{ runner.arch }}-${{ steps.keys.outputs.validating }}-${{ hashFiles('bun.lock') }}-
+
+            - name: Apply the restored TypeScript build info
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  if [[ -d "$RUNNER_TEMP/tsbuild-cache" ]]; then cp -a "$RUNNER_TEMP/tsbuild-cache/." .; fi
+
+            - name: Restore the Vitest transform cache
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ runner.temp }}/filecube-vitest
+                  key: vitest-fs-v2-${{ runner.arch }}-${{ steps.keys.outputs.validating }}-${{ steps.keys.outputs.day }}
+                  restore-keys: |
+                      vitest-fs-v2-${{ runner.arch }}-${{ steps.keys.outputs.validating }}-
+
+            - name: Start PostgreSQL 18 and Valkey 8.0
+              if: needs.plan.outputs.RUN_VALIDATION == 'true' && (needs.plan.outputs.API_CHANGED == 'true' || needs.plan.outputs.DB_CHANGED == 'true' || needs.plan.outputs.BACKGROUND_WORKER_CHANGED == 'true' || needs.plan.outputs.ROOT_CHANGED == 'true')
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
+                      --env POSTGRES_USER=filecube --env POSTGRES_PASSWORD=filecube \
+                      --env POSTGRES_DB=filecube postgres:18 >/dev/null
+                  docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
+
+            - name: Lint and test the selected packages
+              if: needs.plan.outputs.RUN_VALIDATION == 'true'
+              timeout-minutes: 40
+              shell: bash
+              env:
+                  FILECUBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
+              run: bash tools/ci/validate.sh
+
+            # Real-database suites run in their own step, so the unit suite never sees DATABASE_URL.
+            - name: PostgreSQL and Valkey integration tests
+              if: always()
+              timeout-minutes: 20
+              shell: bash
+              env:
+                  DATABASE_URL: postgresql://filecube:filecube@127.0.0.1:5432/filecube
+                  DATABASE_SSL: 'false'
+                  VALKEY_CACHE_URL: redis://127.0.0.1:6379
+                  VALKEY_COORDINATION_URL: redis://127.0.0.1:6379
+                  FILECUBE_REAL_POSTGRES: '1'
+                  FILECUBE_REAL_VALKEY: '1'
+              run: |
+                  set -euo pipefail
+                  docker inspect postgres >/dev/null 2>&1 || exit 0
+                  for attempt in $(seq 1 30); do
+                      docker exec postgres pg_isready -U filecube -d filecube >/dev/null \
+                          && docker exec valkey valkey-cli ping >/dev/null && break
+                      [ "$attempt" -lt 30 ] || { docker logs postgres >&2; docker logs valkey >&2; exit 1; }
+                      sleep 2
+                  done
+                  bash tools/ci/postgres-tests.sh
+
+            - name: Summarize test timing
+              if: always() && needs.plan.outputs.RUN_VALIDATION == 'true'
+              shell: bash
+              env:
+                  FILECUBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
+              run: |
+                  set -euo pipefail
+                  [ -f "$FILECUBE_TEST_REPORTS_DIR/vitest.json" ] || exit 0
+                  bun tools/ci/test-report.mjs "$FILECUBE_TEST_REPORTS_DIR"
+
+            - name: Stage the TypeScript build info
+              if: needs.plan.outputs.RUN_VALIDATION == 'true'
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  rm -rf "$RUNNER_TEMP/tsbuild-cache" && mkdir -p "$RUNNER_TEMP/tsbuild-cache"
+                  # Keep each package's emitted declarations with its build info: tsc -b trusts the build info
+                  # for referenced projects, and without the .d.ts files it fails with TS6305.
+                  cp --parents node_modules/.cache/tsconfig.*.tsbuildinfo "$RUNNER_TEMP/tsbuild-cache/" 2>/dev/null || true
+                  cp -r --parents packages/*/dist "$RUNNER_TEMP/tsbuild-cache/" 2>/dev/null || true
+
+            - name: Set up the deployment Python environment
+              if: always() && needs.plan.outputs.BACKEND_BUILD_CHANGED == 'true'
+              uses: ./.github/actions/setup-python
+
+            - name: Test deployment tooling and workflow contracts
+              if: always() && needs.plan.outputs.BACKEND_BUILD_CHANGED == 'true'
+              timeout-minutes: 20
+              shell: bash
+              run: bash tools/deploy/validate.sh
+
+            - name: Keep the validation reports for the collector
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: validate-reports
+                  path: ${{ runner.temp }}/test-reports
+                  if-no-files-found: ignore
+                  retention-days: 1
+
+    e2e:
+        name: End-to-end tests
+        needs: plan
+        if: inputs.mode == 'ci' && needs.plan.outputs.E2E_CHANGED == 'true'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+        permissions:
+            contents: read
+        env:
+            DATABASE_URL: postgresql://filecube:filecube@127.0.0.1:5432/postgres
+            DATABASE_SSL: 'false'
+            VALKEY_URL: redis://127.0.0.1:6379
+            CACHE_STORAGE_ENDPOINT: http://127.0.0.1:9000/filecube-cache
+            CACHE_STORAGE_ACCESS_KEY_ID: filecube-test
+            CACHE_STORAGE_SECRET_ACCESS_KEY: filecube-test-secret
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  fetch-depth: 0
+
+            - name: Set up Bun and every workspace
+              uses: ./.github/actions/setup-bun
+              with:
+                  install-filters: '[]'
+
+            - name: Start PostgreSQL 18, Valkey 8.0 and MinIO
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
+                      --env POSTGRES_USER=filecube --env POSTGRES_PASSWORD=filecube postgres:18 >/dev/null
+                  docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
+                  # Same MinIO release and image as tools/ci/storage-integration.sh.
+                  docker run --detach --name minio --publish 127.0.0.1:9000:9000 \
+                      --entrypoint /opt/bitnami/minio/bin/minio \
+                      --env MINIO_ROOT_USER="$CACHE_STORAGE_ACCESS_KEY_ID" \
+                      --env MINIO_ROOT_PASSWORD="$CACHE_STORAGE_SECRET_ACCESS_KEY" \
+                      docker.io/bitnamilegacy/minio@sha256:53bd5004cd00becde2e77708cb1f137c7b3c18ce10f79802ec9f50a9244f4530 \
+                      server /tmp/filecube-minio >/dev/null
+                  wait_ready() {
+                      local name="$1" check="$2"
+                      for attempt in $(seq 1 45); do
+                          eval "$check" && return 0
+                          sleep 2
+                      done
+                      docker logs "$name" >&2
+                      return 1
+                  }
+                  wait_ready postgres 'docker exec postgres pg_isready -U filecube' & pg_pid=$!
+                  wait_ready valkey 'docker exec valkey valkey-cli ping' & vk_pid=$!
+                  wait_ready minio 'curl --fail --silent --max-time 2 http://127.0.0.1:9000/minio/health/live' & s3_pid=$!
+                  wait $pg_pid || exit 1
+                  wait $vk_pid || exit 1
+                  wait $s3_pid || exit 1
+
+            - name: Restore the Playwright browsers
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ~/.cache/ms-playwright
+                  key: playwright-v1-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+
+            - name: Install Chromium for Playwright
+              shell: bash
+              run: node node_modules/@playwright/test/cli.js install --with-deps chromium
+
+            - name: Typecheck the end-to-end suite
+              shell: bash
+              run: bun run tsc -p tests/e2e/tsconfig.json
+
+            - name: Run the end-to-end suite
+              timeout-minutes: 30
+              shell: bash
+              env:
+                  E2E_OUTPUT_DIR: ${{ runner.temp }}/e2e-results/output
+                  E2E_JUNIT_FILE: ${{ runner.temp }}/e2e-results/junit/e2e.xml
+              run: bash tools/e2e/run.sh
+
+            - name: Keep the end-to-end results for the collector
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: e2e-results
+                  path: ${{ runner.temp }}/e2e-results
+                  if-no-files-found: ignore
+                  retention-days: 1
+
+    real-services:
+        name: Real services
+        needs: plan
+        if: inputs.mode == 'ci' && inputs.real_services
+        runs-on: ubuntu-24.04
+        timeout-minutes: 120
+        permissions:
+            contents: read
+        env:
+            DATABASE_URL: postgresql://filecube:filecube@127.0.0.1:5432/filecube
+            BUN_PERF_POSTGRES_URL: postgresql://filecube:filecube@127.0.0.1:5432/filecube
+            DATABASE_SSL: 'false'
+            VALKEY_CACHE_URL: redis://127.0.0.1:6379
+            VALKEY_COORDINATION_URL: redis://127.0.0.1:6379
+            CACHE_STORAGE_ENDPOINT: http://127.0.0.1:9000/filecube-cache
+            CACHE_STORAGE_ACCESS_KEY_ID: filecube-test
+            CACHE_STORAGE_SECRET_ACCESS_KEY: filecube-test-secret
+            CACHE_STORAGE_BUCKET: filecube-cache
+            FILECUBE_REAL_POSTGRES: '1'
+            FILECUBE_REAL_MEASUREMENTS: '1'
+            FILECUBE_REAL_VALKEY: '1'
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  fetch-depth: 0
+
+            - name: Set up Bun and every workspace
+              uses: ./.github/actions/setup-bun
+              with:
+                  install-filters: '[]'
+
+            - name: Start PostgreSQL 18 and Valkey 8.0
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
+                      --env POSTGRES_USER=filecube --env POSTGRES_PASSWORD=filecube \
+                      --env POSTGRES_DB=filecube postgres:18 >/dev/null
+                  docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
+                  wait_ready() {
+                      local name="$1" check="$2"
+                      for attempt in $(seq 1 30); do
+                          eval "$check" && return 0
+                          sleep 2
+                      done
+                      docker logs "$name" >&2
+                      return 1
+                  }
+                  wait_ready postgres 'docker exec postgres pg_isready -U filecube -d filecube' & pg_pid=$!
+                  wait_ready valkey 'docker exec valkey valkey-cli ping' & vk_pid=$!
+                  wait $pg_pid || exit 1
+                  wait $vk_pid || exit 1
+
+            - name: Run the storage integration suite
+              timeout-minutes: 30
+              shell: bash
+              run: bash tools/ci/storage-integration.sh
+
+            - name: Check PostgreSQL migrations, snapshot parity, and restore
+              timeout-minutes: 30
+              shell: bash
+              run: bash tools/ci/postgres-integration.sh
+
+            - name: Collect the measurement artifact
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p "$RUNNER_TEMP/artifacts"
+                  cp storage-tiering-measurements-*.json "$RUNNER_TEMP/artifacts/"
+
+            - name: Keep the measurement artifact for the collector
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: real-services-measurements
+                  path: ${{ runner.temp }}/artifacts
+                  if-no-files-found: ignore
+                  retention-days: 1
+
+    scale-benchmark:
+        name: PostgreSQL scale benchmark
+        needs: plan
+        if: inputs.mode == 'ci' && inputs.scale_benchmark != 'none'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 360
+        permissions:
+            contents: read
+        env:
+            BUN_PERF_POSTGRES_URL: postgresql://filecube:filecube@127.0.0.1:5432/postgres
+            DATABASE_SSL: 'false'
+            BENCHMARK_DATASET: ${{ inputs.scale_benchmark }}
+            BENCHMARK_PROFILE: ${{ inputs.benchmark_profile }}
+            BENCHMARK_AREA: ${{ inputs.benchmark_area }}
+            BENCHMARK_ITERATIONS: ${{ inputs.benchmark_iterations }}
+            BENCHMARK_WRITE_ROWS: ${{ inputs.benchmark_write_rows }}
+            BENCHMARK_FILENAMES: ${{ inputs.benchmark_filenames }}
+            BENCHMARK_DERIVATIVE_PERCENT: ${{ inputs.benchmark_derivative_percent }}
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  fetch-depth: 0
+
+            - name: Set up Bun and every workspace
+              uses: ./.github/actions/setup-bun
+              with:
+                  install-filters: '[]'
+
+            - name: Start PostgreSQL 18
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
+                      --env POSTGRES_USER=filecube --env POSTGRES_PASSWORD=filecube \
+                      --env POSTGRES_DB=postgres postgres:18 >/dev/null
+                  for attempt in $(seq 1 30); do
+                      docker exec postgres pg_isready -U filecube -d postgres && exit 0
+                      sleep 2
+                  done
+                  docker logs postgres >&2
+                  exit 1
+
+            - name: Typecheck the scale tools
+              shell: bash
+              run: bun run --bun tsc --project tools/database/tsconfig.perf.json
+
+            - name: Seed the isolated PostgreSQL fixture
+              timeout-minutes: 360
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  seed_args=(--run --filename-profile "$BENCHMARK_FILENAMES" --derivative-percent "$BENCHMARK_DERIVATIVE_PERCENT")
+                  case "$BENCHMARK_DATASET" in
+                      smoke) seed_args+=(--smoke) ;;
+                      full-1m) ;;
+                      *) echo "Unknown benchmark dataset: $BENCHMARK_DATASET" >&2; exit 1 ;;
+                  esac
+                  bun tools/database/seed-local-scale-perf.ts "${seed_args[@]}" | tee "$RUNNER_TEMP/postgres-scale-seed.log"
+                  database="$(jq -Rr 'fromjson? | select(type == "object" and .database) | .database' "$RUNNER_TEMP/postgres-scale-seed.log" | tail -n 1)"
+                  [ -n "$database" ] || { echo 'Seed output did not include the fixture database name' >&2; exit 1; }
+                  echo "FIXTURE_DB=${database}" >> "$GITHUB_ENV"
+
+            - name: Measure the PostgreSQL workload
+              timeout-minutes: 360
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  export BUN_PERF_POSTGRES_URL="postgresql://filecube:filecube@127.0.0.1:5432/${FIXTURE_DB}"
+                  args=(--run --profile "$BENCHMARK_PROFILE" --only "$BENCHMARK_AREA" \
+                      --iterations "$BENCHMARK_ITERATIONS" --output "$RUNNER_TEMP/postgres-scale-benchmark.json")
+                  if [[ "$BENCHMARK_DATASET" == full-1m ]]; then args+=(--require-full); fi
+                  if [[ "$BENCHMARK_WRITE_ROWS" != 0 ]]; then args+=(--write-profile "$BENCHMARK_WRITE_ROWS"); fi
+                  bun tools/database/measure-scale-performance.ts "${args[@]}"
+
+            - name: Compare the rebuilt children indexes
+              timeout-minutes: 360
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  export BUN_PERF_POSTGRES_URL="postgresql://filecube:filecube@127.0.0.1:5432/${FIXTURE_DB}"
+                  iterations=20
+                  if [[ "$BENCHMARK_DATASET" == full-1m ]]; then iterations=100; fi
+                  bun tools/database/compare-children-index.ts --run --iterations "$iterations" \
+                      --output "$RUNNER_TEMP/children-index-comparison.json"
+
+            - name: Check the canonical scale fixture and report after comparison rollback
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  export DATABASE_URL="postgresql://filecube:filecube@127.0.0.1:5432/${FIXTURE_DB}"
+                  bun tools/database/check-scale-fixture.ts "$RUNNER_TEMP/postgres-scale-benchmark.json"
+
+            - name: Compare the children indexes under simultaneous reads and writes
+              timeout-minutes: 360
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  export BUN_PERF_POSTGRES_URL="postgresql://filecube:filecube@127.0.0.1:5432/${FIXTURE_DB}"
+                  iterations=20
+                  if [[ "$BENCHMARK_DATASET" == full-1m ]]; then iterations=100; fi
+                  bun tools/database/measure-children-index-load.ts --run --iterations "$iterations" \
+                      --output "$RUNNER_TEMP/postgres-children-index-load.json"
+
+            # Independent of the fixture: runs even when seeding or measurement failed, so its report still lands.
+            - name: Measure NOTIFY commit cost on a migrated database
+              if: always()
+              timeout-minutes: 20
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  INFISICAL_DISABLE=1 bun tools/database/measure-notify-commit.ts --run \
+                      --output "$RUNNER_TEMP/notify-commit-benchmark.json"
+
+            - name: Collect the benchmark reports
+              if: always()
+              shell: bash
+              run: |
+                  mkdir -p "$RUNNER_TEMP/artifacts"
+                  for report in postgres-scale-benchmark.json children-index-comparison.json \
+                      postgres-children-index-load.json notify-commit-benchmark.json; do
+                      [ -f "$RUNNER_TEMP/$report" ] && cp "$RUNNER_TEMP/$report" "$RUNNER_TEMP/artifacts/" || true
+                  done
+
+            - name: Keep the benchmark reports for the collector
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: scale-benchmark-reports
+                  path: ${{ runner.temp }}/artifacts
+                  if-no-files-found: ignore
+                  retention-days: 1
+
+    # Dependency images for a release, one job per architecture. They hold dependencies only; the
+    # application bundles are appended to them by the release job in the private repository.
+    build-deps:
+        name: Dependency images (${{ matrix.arch }})
+        if: inputs.mode == 'deps'
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 120
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      runner: ubuntu-24.04
+                    - arch: arm64
+                      runner: ubuntu-24.04-arm
+        env:
+            ARCH: ${{ matrix.arch }}
+            TRIVY_VERSION: v0.70.0
+            GHCR_OWNER: ${{ vars.GHCR_OWNER }}
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the release SHA
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  fetch-depth: 1
+                  persist-credentials: false
+
+            - name: Key the dependency images
+              shell: bash
+              env:
+                  SOURCE_SHA: ${{ inputs.source_sha }}
+              run: |
+                  set -euo pipefail
+                  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_sha must be a full commit SHA' >&2; exit 1; }
+                  owner="$(printf '%s' "${GHCR_OWNER:-$GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+                  echo "GHCR_OWNER=${owner}" >> "$GITHUB_ENV"
+                  echo "DEPS_HASH=$(bash tools/deploy/deps-hash.sh "$SOURCE_SHA")" >> "$GITHUB_ENV"
+
+            - name: Log in to GHCR
+              shell: bash
+              env:
+                  GHCR_PUSH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+                  GHCR_PUSH_USERNAME: ${{ vars.GHCR_PUSH_USERNAME }}
+              run: printf '%s' "$GHCR_PUSH_TOKEN" | docker login ghcr.io --username "$GHCR_PUSH_USERNAME" --password-stdin
+
+            - name: Install Trivy
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  curl -sfL --retry 3 --retry-delay 5 \
+                      "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
+                      | sudo sh -s -- -b /usr/local/bin "$TRIVY_VERSION"
+
+            - name: Key the Trivy database cache
+              id: trivy-key
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  echo "key=$(bash tools/deploy/trivy-db-key.sh)" >> "$GITHUB_OUTPUT"
+
+            - name: Restore the Trivy database
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ~/.cache/trivy
+                  key: trivy-db-v1-${{ steps.trivy-key.outputs.key }}
+
+            - name: Build, check and scan the dependency images
+              timeout-minutes: 100
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  docker buildx create --name filecube --driver docker-container --use
+                  # The two builds run concurrently, so the vulnerability DB is downloaded once here and each
+                  # build reads it through a symlink with --skip-db-update. Each build has its own fanal cache.
+                  cache="$HOME/.cache/trivy"
+                  trivy image --download-db-only --cache-dir "$cache" --no-progress >/dev/null
+                  build() {
+                      local name="$1" app="$2" dockerfile ref scan_cache
+                      ref="ghcr.io/${GHCR_OWNER}/${name}-deps:${DEPS_HASH}-${ARCH}"
+                      scan_cache="$HOME/.cache/trivy-${name}"
+                      mkdir -p "$scan_cache" && ln -sfn "$cache/db" "$scan_cache/db"
+                      if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+                          echo "${ref} already exists"
+                          return 0
+                      fi
+                      dockerfile="$RUNNER_TEMP/${name}.Dockerfile"
+                      python3 tools/deploy/deps-dockerfile.py "apps/${app}/Dockerfile" "$app" > "$dockerfile"
+                      trivy config --cache-dir "$scan_cache" --severity CRITICAL,HIGH --exit-code 1 "$dockerfile"
+                      docker buildx build --file "$dockerfile" --target deps --platform "linux/${ARCH}" \
+                          --provenance=false --push --tag "$ref" \
+                          --cache-from "type=registry,ref=ghcr.io/${GHCR_OWNER}/${name}-deps:buildcache-${ARCH}" \
+                          --cache-to "type=registry,ref=ghcr.io/${GHCR_OWNER}/${name}-deps:buildcache-${ARCH},mode=max,compression=zstd,oci-mediatypes=true,image-manifest=true" .
+                      [ "$(docker run --rm --entrypoint id "$ref" -u)" = 1000 ] || { echo "${ref}: bun is not uid 1000" >&2; return 1; }
+                      trivy image --cache-dir "$scan_cache" --skip-db-update --pkg-types os,library --severity CRITICAL,HIGH \
+                          --exit-code 1 --ignore-unfixed "$ref"
+                  }
+                  build filecube-api api &
+                  api=$!
+                  build filecube-background-worker background-worker &
+                  bg=$!
+                  status=0
+                  wait "$api" || status=1
+                  wait "$bg" || status=1
+                  exit "$status"
+
+    # Posts the statuses to the private commit. End-to-end first, Required validation last: the
+    # private repository's collector starts when Required validation lands, and by then every
+    # artifact of this run exists.
+    report:
+        name: Report statuses
+        needs: [plan, validate, e2e, real-services, scale-benchmark]
+        if: always() && inputs.mode == 'ci'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 10
+        permissions:
+            contents: read
+        env:
+            PLAN_RESULT: ${{ needs.plan.result }}
+            VALIDATE_RESULT: ${{ needs.validate.result }}
+            E2E_RESULT: ${{ needs.e2e.result }}
+        steps:
+            - name: Create the status token for the private repository
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-statuses: write
+
+            - name: Post the statuses to the private commit
+              shell: bash
+              env:
+                  GH_TOKEN: ${{ steps.private.outputs.token }}
+                  SOURCE_SHA: ${{ inputs.source_sha }}
+                  PRIVATE_REPOSITORY: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              run: |
+                  set -euo pipefail
+                  [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_sha must be a full commit SHA' >&2; exit 1; }
+                  post() {
+                      jq -n --arg state "$2" --arg context "$1" --arg description "$3" --arg url "$RUN_URL" \
+                          '{state: $state, context: $context, description: $description, target_url: $url}' \
+                          | gh api --method POST "repos/${PRIVATE_REPOSITORY}/statuses/${SOURCE_SHA}" --input - >/dev/null
+                  }
+                  # A skipped end-to-end suite passes when the plan ran; a skipped job after a failed plan does not.
+                  e2e_state=failure
+                  if [[ "$PLAN_RESULT" == success && ( "$E2E_RESULT" == success || "$E2E_RESULT" == skipped ) ]]; then
+                      e2e_state=success
+                  fi
+                  validate_state=failure
+                  if [[ "$PLAN_RESULT" == success && "$VALIDATE_RESULT" == success ]]; then
+                      validate_state=success
+                  fi
+                  post 'End-to-end tests' "$e2e_state" "End-to-end suite: ${E2E_RESULT}"
+                  post 'Required validation' "$validate_state" "Validation: ${VALIDATE_RESULT}"
