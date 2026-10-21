@@ -777,9 +777,8 @@ jobs:
                   wait "$bg" || status=1
                   exit "$status"
 
-    # Posts the statuses to the private commit. End-to-end first, Required validation last: the
-    # private repository's collector starts when Required validation lands, and by then every
-    # artifact of this run exists.
+    # Posts the statuses to the private commit. The private repository's collect job waits for this
+    # run to finish, so the artifacts above exist by then.
     report:
         name: Report statuses
         needs: [plan, validate, e2e, real-services, scale-benchmark]
