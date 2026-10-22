@@ -128,6 +128,7 @@ jobs:
                   repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
                   ref: ${{ inputs.source_sha }}
                   token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
                   fetch-depth: 0
 
             - name: Set up Bun
@@ -138,10 +139,16 @@ jobs:
               shell: bash
               env:
                   ALL_AREAS: ${{ inputs.all_areas }}
+                  GH_TOKEN: ${{ steps.private.outputs.token }}
               run: |
                   set -euo pipefail
-                  # The area filters diff against origin/main, which the checkout does not fetch.
+                  # The area filters diff against origin/main, which the checkout does not fetch. The checkout
+                  # keeps no credentials, so this one fetch gets the token from the environment, not from git config.
+                  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+                  GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+                  export GIT_CONFIG_VALUE_0
                   git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+                  unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
                   if [[ "$ALL_AREAS" == true ]]; then
                       bun tools/ci/changed-areas.mjs --all > "$RUNNER_TEMP/areas.env"
                   else
@@ -203,6 +210,7 @@ jobs:
                   repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
                   ref: ${{ inputs.source_sha }}
                   token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
                   fetch-depth: 0
 
             - name: Set up Bun and the selected dependencies
@@ -356,6 +364,7 @@ jobs:
                   repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
                   ref: ${{ inputs.source_sha }}
                   token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
                   fetch-depth: 0
 
             - name: Set up Bun and every workspace
@@ -462,6 +471,7 @@ jobs:
                   repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
                   ref: ${{ inputs.source_sha }}
                   token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
                   fetch-depth: 0
 
             - name: Set up Bun and every workspace
@@ -552,6 +562,7 @@ jobs:
                   repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
                   ref: ${{ inputs.source_sha }}
                   token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
                   fetch-depth: 0
 
             - name: Set up Bun and every workspace
@@ -701,8 +712,8 @@ jobs:
                   repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
                   ref: ${{ inputs.source_sha }}
                   token: ${{ steps.private.outputs.token }}
-                  fetch-depth: 1
                   persist-credentials: false
+                  fetch-depth: 1
 
             - name: Key the dependency images
               shell: bash
