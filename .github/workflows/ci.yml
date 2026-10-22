@@ -163,19 +163,11 @@ jobs:
                   set -euo pipefail
                   source "$RUNNER_TEMP/areas.env"
                   filters=''
+                  # Validation installs every workspace. Its lint and typecheck read every tsconfig, and a
+                  # filtered install leaves some of them without their types. Public runners are free, so the
+                  # saving from filtering was never worth it.
                   if [[ "$RUN_VALIDATION" == true ]]; then
-                      if [[ "$ROOT_CHANGED" == true ]]; then
-                          filters='[]'
-                      else
-                          selected=()
-                          [[ "$API_CHANGED" != true ]] || selected+=('@filecube/api')
-                          [[ "$DB_CHANGED" != true ]] || selected+=('@filecube/db')
-                          [[ "$WEB_CHANGED" != true ]] || selected+=('@filecube/web')
-                          [[ "$WORKER_CHANGED" != true ]] || selected+=('@filecube/worker')
-                          [[ "$BACKGROUND_WORKER_CHANGED" != true ]] || selected+=('@filecube/background-worker')
-                          selected+=(filecube)
-                          filters="$(printf '%s\n' "${selected[@]}" | jq -Rsc 'split("\n")[:-1]')"
-                      fi
+                      filters='[]'
                   elif [[ "$BACKEND_BUILD_CHANGED" == true ]]; then
                       filters='["filecube"]'
                   fi
@@ -267,6 +259,13 @@ jobs:
               shell: bash
               env:
                   FILECUBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
+                  # validate.sh reads these to choose which packages to lint, typecheck and test.
+                  ROOT_CHANGED: ${{ needs.plan.outputs.ROOT_CHANGED }}
+                  API_CHANGED: ${{ needs.plan.outputs.API_CHANGED }}
+                  DB_CHANGED: ${{ needs.plan.outputs.DB_CHANGED }}
+                  WEB_CHANGED: ${{ needs.plan.outputs.WEB_CHANGED }}
+                  WORKER_CHANGED: ${{ needs.plan.outputs.WORKER_CHANGED }}
+                  BACKGROUND_WORKER_CHANGED: ${{ needs.plan.outputs.BACKGROUND_WORKER_CHANGED }}
               run: bash tools/ci/validate.sh
 
             # Real-database suites run in their own step, so the unit suite never sees DATABASE_URL.
