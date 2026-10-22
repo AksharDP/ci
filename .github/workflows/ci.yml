@@ -161,17 +161,9 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  source "$RUNNER_TEMP/areas.env"
-                  filters=''
-                  # Validation installs every workspace. Its lint and typecheck read every tsconfig, and a
-                  # filtered install leaves some of them without their types. Public runners are free, so the
-                  # saving from filtering was never worth it.
-                  if [[ "$RUN_VALIDATION" == true ]]; then
-                      filters='[]'
-                  elif [[ "$BACKEND_BUILD_CHANGED" == true ]]; then
-                      filters='["filecube"]'
-                  fi
-                  echo "INSTALL_FILTERS=${filters}" >> "$GITHUB_OUTPUT"
+                  # Every run installs every workspace. Lint reads every tsconfig, and a filtered install leaves some
+                  # of them without their types. Public runners are free, so filtering saved nothing that mattered.
+                  echo "INSTALL_FILTERS=[]" >> "$GITHUB_OUTPUT"
 
     # Reports the status `Required validation`. The private repository's branch protection and its
     # release gate match that name, so keep it.
@@ -253,8 +245,8 @@ jobs:
                       --env POSTGRES_DB=filecube postgres:18 >/dev/null
                   docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
 
+            # Format and lint run on every pull request. validate.sh runs unit tests and typecheck only for changed areas.
             - name: Lint and test the selected packages
-              if: needs.plan.outputs.RUN_VALIDATION == 'true'
               timeout-minutes: 40
               shell: bash
               env:
