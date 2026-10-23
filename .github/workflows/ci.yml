@@ -241,8 +241,8 @@ jobs:
               run: |
                   set -euo pipefail
                   docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
-                      --env POSTGRES_USER=ci --env POSTGRES_PASSWORD=ci \
-                      --env POSTGRES_DB=ci postgres:18 >/dev/null
+                      --env POSTGRES_USER=fcbe --env POSTGRES_PASSWORD=fcbe \
+                      --env POSTGRES_DB=fcbe postgres:18 >/dev/null
                   docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
 
             # Format and lint run on every pull request. validate.sh runs unit tests and typecheck only for changed areas.
@@ -266,7 +266,7 @@ jobs:
               timeout-minutes: 20
               shell: bash
               env:
-                  DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci
+                  DATABASE_URL: postgresql://fcbe:fcbe@127.0.0.1:5432/fcbe
                   DATABASE_SSL: 'false'
                   VALKEY_CACHE_URL: redis://127.0.0.1:6379
                   VALKEY_COORDINATION_URL: redis://127.0.0.1:6379
@@ -276,7 +276,7 @@ jobs:
                   set -euo pipefail
                   docker inspect postgres >/dev/null 2>&1 || exit 0
                   for attempt in $(seq 1 30); do
-                      docker exec postgres pg_isready -U ci -d ci >/dev/null \
+                      docker exec postgres pg_isready -U fcbe -d fcbe >/dev/null \
                           && docker exec valkey valkey-cli ping >/dev/null && break
                       [ "$attempt" -lt 30 ] || { docker logs postgres >&2; docker logs valkey >&2; exit 1; }
                       sleep 2
@@ -332,13 +332,13 @@ jobs:
         permissions:
             contents: read
         env:
-            DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/postgres
+            DATABASE_URL: postgresql://fcbe:fcbe@127.0.0.1:5432/postgres
             DATABASE_SSL: 'false'
             VALKEY_URL: redis://127.0.0.1:6379
-            CACHE_STORAGE_ENDPOINT: http://127.0.0.1:9000/ci-cache
-            CACHE_STORAGE_BUCKET: ci-cache
-            CACHE_STORAGE_ACCESS_KEY_ID: ci-test
-            CACHE_STORAGE_SECRET_ACCESS_KEY: ci-test-secret
+            CACHE_STORAGE_ENDPOINT: http://127.0.0.1:9000/fcbe-cache
+            CACHE_STORAGE_BUCKET: fcbe-cache
+            CACHE_STORAGE_ACCESS_KEY_ID: fcbe-test
+            CACHE_STORAGE_SECRET_ACCESS_KEY: fcbe-test-secret
         steps:
             - name: Create the private repository token
               id: private
@@ -369,7 +369,7 @@ jobs:
               run: |
                   set -euo pipefail
                   docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
-                      --env POSTGRES_USER=ci --env POSTGRES_PASSWORD=ci postgres:18 >/dev/null
+                      --env POSTGRES_USER=fcbe --env POSTGRES_PASSWORD=fcbe postgres:18 >/dev/null
                   docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
                   # Same MinIO release and image as tools/ci/storage-integration.sh.
                   docker run --detach --name minio --publish 127.0.0.1:9000:9000 \
@@ -377,7 +377,7 @@ jobs:
                       --env MINIO_ROOT_USER="$CACHE_STORAGE_ACCESS_KEY_ID" \
                       --env MINIO_ROOT_PASSWORD="$CACHE_STORAGE_SECRET_ACCESS_KEY" \
                       docker.io/bitnamilegacy/minio@sha256:53bd5004cd00becde2e77708cb1f137c7b3c18ce10f79802ec9f50a9244f4530 \
-                      server /tmp/minio-data >/dev/null
+                      server /tmp/fcbe-minio >/dev/null
                   wait_ready() {
                       local name="$1" check="$2"
                       for attempt in $(seq 1 45); do
@@ -387,7 +387,7 @@ jobs:
                       docker logs "$name" >&2
                       return 1
                   }
-                  wait_ready postgres 'docker exec postgres pg_isready -U ci' & pg_pid=$!
+                  wait_ready postgres 'docker exec postgres pg_isready -U fcbe' & pg_pid=$!
                   wait_ready valkey 'docker exec valkey valkey-cli ping' & vk_pid=$!
                   wait_ready minio 'curl --fail --silent --max-time 2 http://127.0.0.1:9000/minio/health/live' & s3_pid=$!
                   wait $pg_pid || exit 1
@@ -434,14 +434,14 @@ jobs:
         permissions:
             contents: read
         env:
-            DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci
-            BUN_PERF_POSTGRES_URL: postgresql://ci:ci@127.0.0.1:5432/ci
+            DATABASE_URL: postgresql://fcbe:fcbe@127.0.0.1:5432/fcbe
+            BUN_PERF_POSTGRES_URL: postgresql://fcbe:fcbe@127.0.0.1:5432/fcbe
             DATABASE_SSL: 'false'
             VALKEY_CACHE_URL: redis://127.0.0.1:6379
             VALKEY_COORDINATION_URL: redis://127.0.0.1:6379
             CACHE_STORAGE_ENDPOINT: http://127.0.0.1:9000/filecube-cache
-            CACHE_STORAGE_ACCESS_KEY_ID: ci-test
-            CACHE_STORAGE_SECRET_ACCESS_KEY: ci-test-secret
+            CACHE_STORAGE_ACCESS_KEY_ID: fcbe-test
+            CACHE_STORAGE_SECRET_ACCESS_KEY: fcbe-test-secret
             CACHE_STORAGE_BUCKET: filecube-cache
             FILECUBE_REAL_POSTGRES: '1'
             FILECUBE_REAL_MEASUREMENTS: '1'
@@ -476,8 +476,8 @@ jobs:
               run: |
                   set -euo pipefail
                   docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
-                      --env POSTGRES_USER=ci --env POSTGRES_PASSWORD=ci \
-                      --env POSTGRES_DB=ci postgres:18 >/dev/null
+                      --env POSTGRES_USER=fcbe --env POSTGRES_PASSWORD=fcbe \
+                      --env POSTGRES_DB=fcbe postgres:18 >/dev/null
                   docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
                   wait_ready() {
                       local name="$1" check="$2"
@@ -488,7 +488,7 @@ jobs:
                       docker logs "$name" >&2
                       return 1
                   }
-                  wait_ready postgres 'docker exec postgres pg_isready -U ci -d ci' & pg_pid=$!
+                  wait_ready postgres 'docker exec postgres pg_isready -U fcbe -d fcbe' & pg_pid=$!
                   wait_ready valkey 'docker exec valkey valkey-cli ping' & vk_pid=$!
                   wait $pg_pid || exit 1
                   wait $vk_pid || exit 1
@@ -528,7 +528,7 @@ jobs:
         permissions:
             contents: read
         env:
-            BUN_PERF_POSTGRES_URL: postgresql://ci:ci@127.0.0.1:5432/postgres
+            BUN_PERF_POSTGRES_URL: postgresql://fcbe:fcbe@127.0.0.1:5432/postgres
             DATABASE_SSL: 'false'
             BENCHMARK_DATASET: ${{ inputs.scale_benchmark }}
             BENCHMARK_PROFILE: ${{ inputs.benchmark_profile }}
@@ -567,10 +567,10 @@ jobs:
               run: |
                   set -euo pipefail
                   docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
-                      --env POSTGRES_USER=ci --env POSTGRES_PASSWORD=ci \
+                      --env POSTGRES_USER=fcbe --env POSTGRES_PASSWORD=fcbe \
                       --env POSTGRES_DB=postgres postgres:18 >/dev/null
                   for attempt in $(seq 1 30); do
-                      docker exec postgres pg_isready -U ci -d postgres && exit 0
+                      docker exec postgres pg_isready -U fcbe -d postgres && exit 0
                       sleep 2
                   done
                   docker logs postgres >&2
@@ -601,7 +601,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  export BUN_PERF_POSTGRES_URL="postgresql://ci:ci@127.0.0.1:5432/${FIXTURE_DB}"
+                  export BUN_PERF_POSTGRES_URL="postgresql://fcbe:fcbe@127.0.0.1:5432/${FIXTURE_DB}"
                   args=(--run --profile "$BENCHMARK_PROFILE" --only "$BENCHMARK_AREA" \
                       --iterations "$BENCHMARK_ITERATIONS" --output "$RUNNER_TEMP/postgres-scale-benchmark.json")
                   if [[ "$BENCHMARK_DATASET" == full-1m ]]; then args+=(--require-full); fi
@@ -613,7 +613,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  export BUN_PERF_POSTGRES_URL="postgresql://ci:ci@127.0.0.1:5432/${FIXTURE_DB}"
+                  export BUN_PERF_POSTGRES_URL="postgresql://fcbe:fcbe@127.0.0.1:5432/${FIXTURE_DB}"
                   iterations=20
                   if [[ "$BENCHMARK_DATASET" == full-1m ]]; then iterations=100; fi
                   bun tools/database/compare-children-index.ts --run --iterations "$iterations" \
@@ -623,7 +623,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  export DATABASE_URL="postgresql://ci:ci@127.0.0.1:5432/${FIXTURE_DB}"
+                  export DATABASE_URL="postgresql://fcbe:fcbe@127.0.0.1:5432/${FIXTURE_DB}"
                   bun tools/database/check-scale-fixture.ts "$RUNNER_TEMP/postgres-scale-benchmark.json"
 
             - name: Compare the children indexes under simultaneous reads and writes
@@ -631,7 +631,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  export BUN_PERF_POSTGRES_URL="postgresql://ci:ci@127.0.0.1:5432/${FIXTURE_DB}"
+                  export BUN_PERF_POSTGRES_URL="postgresql://fcbe:fcbe@127.0.0.1:5432/${FIXTURE_DB}"
                   iterations=20
                   if [[ "$BENCHMARK_DATASET" == full-1m ]]; then iterations=100; fi
                   bun tools/database/measure-children-index-load.ts --run --iterations "$iterations" \
@@ -751,7 +751,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
-                  docker buildx create --name deps-builder --driver docker-container --use
+                  docker buildx create --name fcbe --driver docker-container --use
                   # The two builds run concurrently, so the vulnerability DB is downloaded once here and each
                   # build reads it through a symlink with --skip-db-update. Each build has its own fanal cache.
                   cache="$HOME/.cache/trivy"
