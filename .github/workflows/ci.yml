@@ -176,7 +176,7 @@ jobs:
         permissions:
             contents: read
         env:
-            FCBE_TEST_COVERAGE: ${{ inputs.coverage }}
+            FILECUBE_TEST_COVERAGE: ${{ inputs.coverage }}
         steps:
             - name: Create the private repository token
               id: private
@@ -250,7 +250,7 @@ jobs:
               timeout-minutes: 40
               shell: bash
               env:
-                  FCBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
+                  FILECUBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
                   # validate.sh reads these to choose which packages to lint, typecheck and test.
                   ROOT_CHANGED: ${{ needs.plan.outputs.ROOT_CHANGED }}
                   API_CHANGED: ${{ needs.plan.outputs.API_CHANGED }}
@@ -270,8 +270,8 @@ jobs:
                   DATABASE_SSL: 'false'
                   VALKEY_CACHE_URL: redis://127.0.0.1:6379
                   VALKEY_COORDINATION_URL: redis://127.0.0.1:6379
-                  FCBE_REAL_POSTGRES: '1'
-                  FCBE_REAL_VALKEY: '1'
+                  FILECUBE_REAL_POSTGRES: '1'
+                  FILECUBE_REAL_VALKEY: '1'
               run: |
                   set -euo pipefail
                   docker inspect postgres >/dev/null 2>&1 || exit 0
@@ -287,11 +287,11 @@ jobs:
               if: always() && needs.plan.outputs.RUN_VALIDATION == 'true'
               shell: bash
               env:
-                  FCBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
+                  FILECUBE_TEST_REPORTS_DIR: ${{ runner.temp }}/test-reports
               run: |
                   set -euo pipefail
-                  [ -f "$FCBE_TEST_REPORTS_DIR/vitest.json" ] || exit 0
-                  bun tools/ci/test-report.mjs "$FCBE_TEST_REPORTS_DIR"
+                  [ -f "$FILECUBE_TEST_REPORTS_DIR/vitest.json" ] || exit 0
+                  bun tools/ci/test-report.mjs "$FILECUBE_TEST_REPORTS_DIR"
 
             - name: Stage the TypeScript build info
               if: needs.plan.outputs.RUN_VALIDATION == 'true'
@@ -443,9 +443,9 @@ jobs:
             CACHE_STORAGE_ACCESS_KEY_ID: fcbe-test
             CACHE_STORAGE_SECRET_ACCESS_KEY: fcbe-test-secret
             CACHE_STORAGE_BUCKET: fcbe-cache
-            FCBE_REAL_POSTGRES: '1'
-            FCBE_REAL_MEASUREMENTS: '1'
-            FCBE_REAL_VALKEY: '1'
+            FILECUBE_REAL_POSTGRES: '1'
+            FILECUBE_REAL_MEASUREMENTS: '1'
+            FILECUBE_REAL_VALKEY: '1'
         steps:
             - name: Create the private repository token
               id: private
