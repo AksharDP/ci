@@ -787,7 +787,7 @@ jobs:
                       --postgres-url postgresql://fcbe:fcbe@127.0.0.1:5432/postgres \
                       --fixture "$LATENCY_FIXTURE_DB" \
                       --out "$RUNNER_TEMP/latency-results" \
-                      --rounds 2
+                      --rounds 4
 
             - name: Keep the latency results
               if: always()
