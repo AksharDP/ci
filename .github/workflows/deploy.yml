@@ -1,0 +1,390 @@
+name: Deploy
+
+# The production release, run on this repository's runners. The private repository's tools/deploy/submit.sh dispatches
+# it through the dispatch GitHub App, and only the actors listed in the DEPLOY_ALLOWED_ACTORS variable may dispatch it.
+# Release secrets are not stored here. Each job fetches them from Infisical, using the two machine-identity secrets
+# in the production environment.
+#
+# Keep it dispatch-only. A pull_request or push trigger would run code from other sources with those secrets. The
+# production environment must stay restricted to the main branch. Setup: README.md in this repository.
+#
+# Every job checks out the private repository's main with a read-only token. The release scripts there keep release
+# state as GitHub Deployments and read commit statuses in the private repository, so the release step points
+# GITHUB_REPOSITORY at it.
+
+on:
+    workflow_dispatch:
+        inputs:
+            request_id:
+                description: Names the run; the run title is Deploy followed by this ID
+                required: true
+                type: string
+            source_sha:
+                description: Full commit SHA on main to release; empty only for a reconcile
+                required: false
+                type: string
+                default: ''
+            reconcile:
+                description: true re-applies the recorded good release and repairs host drift; it ships nothing
+                required: false
+                type: string
+                default: 'false'
+            skip_smoke:
+                description: true skips the upload smoke test for this release (break-glass; needs a reason)
+                required: false
+                type: string
+                default: 'false'
+            smoke_bypass_reason_b64:
+                description: Base64 of the single-line break-glass reason; empty unless skip_smoke is true
+                required: false
+                type: string
+                default: ''
+            actor:
+                description: The person who asked for the release, recorded in the audit trail
+                required: false
+                type: string
+                default: ''
+            event:
+                description: workflow_dispatch for a request; push when the inventory changed
+                required: false
+                type: string
+                default: workflow_dispatch
+
+run-name: Deploy ${{ inputs.request_id }}
+
+concurrency:
+    group: filecube-production
+    cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+    prepare:
+        name: Check the request and resolve the commit
+        runs-on: ubuntu-24.04
+        timeout-minutes: 15
+        environment: production
+        permissions:
+            contents: read
+        env:
+            GHCR_OWNER: ${{ vars.GHCR_OWNER }}
+        # The SHA and the dependency decision are the only outputs. The release job reads everything else itself.
+        outputs:
+            sha: ${{ steps.commit.outputs.sha }}
+            deps: ${{ steps.fetch.outputs.deps }}
+        steps:
+            - name: Check the dispatcher and the request
+              shell: bash
+              env:
+                  ACTOR: ${{ github.actor }}
+                  ALLOWED: ${{ vars.DEPLOY_ALLOWED_ACTORS }}
+                  REF: ${{ github.ref }}
+                  REQUEST_ID: ${{ inputs.request_id }}
+                  SOURCE_SHA: ${{ inputs.source_sha }}
+                  RECONCILE: ${{ inputs.reconcile }}
+                  SKIP_SMOKE: ${{ inputs.skip_smoke }}
+                  SMOKE_BYPASS_REASON_B64: ${{ inputs.smoke_bypass_reason_b64 }}
+                  REQUEST_ACTOR: ${{ inputs.actor }}
+                  EVENT: ${{ inputs.event }}
+              run: |
+                  set -euo pipefail
+                  fail() { echo "error: $*" >&2; exit 1; }
+
+                  [[ "$REF" == refs/heads/main ]] || fail "Deploy runs only from refs/heads/main, not ${REF}"
+                  # An empty list fails closed: nobody may dispatch until someone is listed.
+                  [[ -n "${ALLOWED//[[:space:],]/}" ]] || fail 'DEPLOY_ALLOWED_ACTORS is empty, so nobody may dispatch Deploy'
+                  allowed=false
+                  IFS=',' read -ra entries <<< "$ALLOWED"
+                  for entry in "${entries[@]}"; do
+                      entry="${entry#"${entry%%[![:space:]]*}"}"
+                      entry="${entry%"${entry##*[![:space:]]}"}"
+                      if [[ -n "$entry" && "$entry" == "$ACTOR" ]]; then allowed=true; fi
+                  done
+                  [[ "$allowed" == true ]] || fail "${ACTOR:-no actor} may not dispatch Deploy (see DEPLOY_ALLOWED_ACTORS)"
+
+                  [[ "$REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+                      || fail 'request_id must be 1 to 64 letters, digits, dots, underscores or hyphens'
+                  case "$RECONCILE" in true | false) ;; *) fail "reconcile must be true or false, not '${RECONCILE}'" ;; esac
+                  case "$SKIP_SMOKE" in true | false) ;; *) fail "skip_smoke must be true or false, not '${SKIP_SMOKE}'" ;; esac
+                  case "$EVENT" in workflow_dispatch | push) ;; *) fail "event must be workflow_dispatch or push, not '${EVENT}'" ;; esac
+                  if [[ "$RECONCILE" == true ]]; then
+                      [[ -z "$SOURCE_SHA" ]] || fail 'reconcile re-applies the recorded good release; leave source_sha empty'
+                  else
+                      [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'source_sha must be a full 40-character lowercase commit SHA'
+                  fi
+                  [[ "$REQUEST_ACTOR" != *[[:cntrl:]]* && ${#REQUEST_ACTOR} -le 100 ]] \
+                      || fail 'actor must be one line of at most 100 characters'
+
+                  # The reason is base64 of the raw text. Decoding to a file keeps a trailing newline visible to wc.
+                  reason_file="$(mktemp)"
+                  trap 'rm -f "$reason_file"' EXIT
+                  printf '%s' "$SMOKE_BYPASS_REASON_B64" | base64 -d > "$reason_file" 2>/dev/null \
+                      || fail 'smoke_bypass_reason_b64 is not valid base64'
+                  if [[ "$(wc -l < "$reason_file")" -ne 0 ]] || grep -q $'\r' "$reason_file"; then
+                      fail 'smoke_bypass_reason must be a single line'
+                  fi
+                  if [[ "$SKIP_SMOKE" == true ]]; then
+                      [[ "$RECONCILE" == false ]] || fail 'skip_smoke applies to a release, not a reconcile'
+                      grep -q '[^[:space:]]' "$reason_file" \
+                          || fail 'skip_smoke requires a non-empty smoke_bypass_reason (break-glass)'
+                      [[ -n "$REQUEST_ACTOR" ]] || fail 'skip_smoke requires the requesting actor for the audit trail'
+                  elif [[ -s "$reason_file" ]]; then
+                      fail 'smoke_bypass_reason requires skip_smoke=true'
+                  fi
+
+                  echo "Request ${REQUEST_ID} by ${ACTOR}: source_sha=${SOURCE_SHA:-none} reconcile=${RECONCILE} skip_smoke=${SKIP_SMOKE} event=${EVENT}"
+
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            # Full history and no blob filter: this job keeps no credentials, so a lazily fetched blob would fail later.
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: main
+                  token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
+                  fetch-depth: 0
+
+            - name: Resolve the commit to release
+              id: commit
+              if: inputs.reconcile != 'true'
+              shell: bash
+              env:
+                  GH_TOKEN: ${{ steps.private.outputs.token }}
+                  REQUESTED_SHA: ${{ inputs.source_sha }}
+              run: |
+                  set -euo pipefail
+                  # The resolver fetches origin, which needs credentials. The header goes in git's environment config
+                  # for that one command, and its encoded form is masked so it never reaches the log.
+                  auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+                  echo "::add-mask::${auth}"
+                  sha="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                      GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" \
+                      bash .github/scripts/resolve-production-sha.sh "$REQUESTED_SHA")"
+                  echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+            # The secrets are fetched into a file and never printed. infisical-secrets.sh prints ::add-mask:: lines
+            # for the runner, so its stdout is not captured. Its values are masked from here on.
+            - name: Fetch the release secrets and decide on the dependency images
+              id: fetch
+              shell: bash
+              env:
+                  DEPLOY_INFISICAL_CLIENT_ID: ${{ secrets.DEPLOY_INFISICAL_CLIENT_ID }}
+                  DEPLOY_INFISICAL_CLIENT_SECRET: ${{ secrets.DEPLOY_INFISICAL_CLIENT_SECRET }}
+                  DEPLOY_INFISICAL_PROJECT_ID: ${{ vars.DEPLOY_INFISICAL_PROJECT_ID }}
+                  DEPLOY_INFISICAL_ENV: ${{ vars.DEPLOY_INFISICAL_ENV }}
+                  DEPLOY_INFISICAL_PATH: ${{ vars.DEPLOY_INFISICAL_PATH }}
+                  DEPLOY_INFISICAL_SITE_URL: ${{ vars.DEPLOY_INFISICAL_SITE_URL }}
+                  DEPLOY_SHA: ${{ steps.commit.outputs.sha }}
+              run: |
+                  set -euo pipefail
+                  file="$(mktemp)"
+                  trap 'rm -f "$file"' EXIT
+                  bash tools/deploy/infisical-secrets.sh "$file"
+                  export SECRETS_JSON="$(<"$file")"
+                  bash tools/deploy/release-secrets.sh check
+                  deps=false
+                  if [[ -n "$DEPLOY_SHA" ]]; then
+                      # The lookup reads the registry with the pull login, which is not in the ghcr group.
+                      GHCR_PULL_USER="$(jq -r '.GHCR_PULL_USER // empty' <<< "$SECRETS_JSON")"
+                      GHCR_PULL_TOKEN="$(jq -r '.GHCR_PULL_TOKEN // empty' <<< "$SECRETS_JSON")"
+                      export GHCR_PULL_USER GHCR_PULL_TOKEN
+                      deps="$(GHCR_OWNER="${GHCR_OWNER:-$GITHUB_REPOSITORY_OWNER}" bash tools/deploy/deps-missing.sh)"
+                  fi
+                  case "$deps" in
+                      true | false) ;;
+                      *) echo "error: deps-missing.sh printed '${deps}', not true or false" >&2; exit 1 ;;
+                  esac
+                  unset SECRETS_JSON DEPLOY_INFISICAL_CLIENT_ID DEPLOY_INFISICAL_CLIENT_SECRET
+                  echo "deps=${deps}" >> "$GITHUB_OUTPUT"
+
+    # Builds the dependency images for one architecture when no earlier release built them for this key.
+    deps:
+        name: Dependency images (${{ matrix.arch }})
+        needs: prepare
+        if: needs.prepare.outputs.deps == 'true'
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 120
+        environment: production
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: amd64
+                      runner: ubuntu-24.04
+                    - arch: arm64
+                      runner: ubuntu-24.04-arm
+        env:
+            ARCH: ${{ matrix.arch }}
+            GHCR_OWNER: ${{ vars.GHCR_OWNER }}
+            DEPLOY_SHA: ${{ needs.prepare.outputs.sha }}
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: main
+                  token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
+                  fetch-depth: 0
+
+            - name: Key the Trivy database cache
+              id: trivy-key
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  echo "key=$(bash tools/deploy/trivy-db-key.sh)" >> "$GITHUB_OUTPUT"
+
+            - name: Restore the Trivy database
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ~/.cache/trivy
+                  key: trivy-db-v1-${{ steps.trivy-key.outputs.key }}
+
+            - name: Fetch the release secrets and build, check and scan the dependency images
+              timeout-minutes: 100
+              shell: bash
+              env:
+                  DEPLOY_INFISICAL_CLIENT_ID: ${{ secrets.DEPLOY_INFISICAL_CLIENT_ID }}
+                  DEPLOY_INFISICAL_CLIENT_SECRET: ${{ secrets.DEPLOY_INFISICAL_CLIENT_SECRET }}
+                  DEPLOY_INFISICAL_PROJECT_ID: ${{ vars.DEPLOY_INFISICAL_PROJECT_ID }}
+                  DEPLOY_INFISICAL_ENV: ${{ vars.DEPLOY_INFISICAL_ENV }}
+                  DEPLOY_INFISICAL_PATH: ${{ vars.DEPLOY_INFISICAL_PATH }}
+                  DEPLOY_INFISICAL_SITE_URL: ${{ vars.DEPLOY_INFISICAL_SITE_URL }}
+              run: |
+                  set -euo pipefail
+                  file="$(mktemp)"
+                  trap 'rm -f "$file"' EXIT
+                  bash tools/deploy/infisical-secrets.sh "$file"
+                  export SECRETS_JSON="$(<"$file")"
+                  bash tools/deploy/release-secrets.sh check
+                  eval "$(bash tools/deploy/release-secrets.sh env ghcr)"
+                  unset SECRETS_JSON DEPLOY_INFISICAL_CLIENT_ID DEPLOY_INFISICAL_CLIENT_SECRET
+                  # build-deps.sh reads the owner from GHCR_OWNER only, so it needs the repository owner as the fallback.
+                  export GHCR_OWNER="${GHCR_OWNER:-$GITHUB_REPOSITORY_OWNER}"
+                  bash tools/deploy/build-deps.sh "$ARCH"
+
+    # Runs tools/deploy/ci-release.sh, the same release job that the CircleCI and Semaphore backends run. The concurrency
+    # group above is per repository: the private repository's filecube-production workflows (restart and token
+    # rotation) do not wait for a Deploy run here, and a Deploy run does not wait for them.
+    release:
+        name: Release
+        needs: [prepare, deps]
+        if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.deps.result == 'success' || needs.deps.result == 'skipped') }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 150
+        environment: production
+        permissions:
+            contents: read
+        env:
+            GHCR_OWNER: ${{ vars.GHCR_OWNER }}
+        steps:
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: main
+                  token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
+                  fetch-depth: 0
+
+            - name: Set up the deployment Python environment
+              uses: ./.github/actions/setup-python
+
+            - name: Release
+              shell: bash
+              env:
+                  PRIVATE_READER_TOKEN: ${{ steps.private.outputs.token }}
+                  PRIVATE_REPOSITORY_NAME: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  DEPLOY_INFISICAL_CLIENT_ID: ${{ secrets.DEPLOY_INFISICAL_CLIENT_ID }}
+                  DEPLOY_INFISICAL_CLIENT_SECRET: ${{ secrets.DEPLOY_INFISICAL_CLIENT_SECRET }}
+                  DEPLOY_INFISICAL_PROJECT_ID: ${{ vars.DEPLOY_INFISICAL_PROJECT_ID }}
+                  DEPLOY_INFISICAL_ENV: ${{ vars.DEPLOY_INFISICAL_ENV }}
+                  DEPLOY_INFISICAL_PATH: ${{ vars.DEPLOY_INFISICAL_PATH }}
+                  DEPLOY_INFISICAL_SITE_URL: ${{ vars.DEPLOY_INFISICAL_SITE_URL }}
+                  DEPLOY_SHA: ${{ needs.prepare.outputs.sha }}
+                  REQUESTED_SHA: ${{ inputs.source_sha }}
+                  RECONCILE: ${{ inputs.reconcile }}
+                  DEPLOY_SKIP_SMOKE: ${{ inputs.skip_smoke }}
+                  DEPLOY_SMOKE_BYPASS_REASON_B64: ${{ inputs.smoke_bypass_reason_b64 }}
+                  DEPLOY_ACTOR: ${{ inputs.actor }}
+                  DEPLOY_EVENT: ${{ inputs.event }}
+                  TRIVY_REPORT_DIR: ${{ runner.temp }}/trivy-reports
+              run: |
+                  set -euo pipefail
+                  # release.sh resolves commits with git fetch, and this checkout keeps no credentials. The reader token
+                  # goes in git's environment config for this step, and its encoded form is masked.
+                  auth="$(printf 'x-access-token:%s' "$PRIVATE_READER_TOKEN" | base64 -w0)"
+                  echo "::add-mask::${auth}"
+                  export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                      GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+                  unset PRIVATE_READER_TOKEN
+
+                  # The commit prepare resolved must be the one requested. An empty commit would make release.sh
+                  # reconcile the good release instead of shipping this one.
+                  if [[ "$RECONCILE" == true ]]; then
+                      [[ -z "$DEPLOY_SHA" ]] || { echo 'error: a reconcile must not name a commit' >&2; exit 1; }
+                  else
+                      [[ "$DEPLOY_SHA" == "$REQUESTED_SHA" ]] \
+                          || { echo 'error: the resolved commit does not match source_sha' >&2; exit 1; }
+                  fi
+
+                  file="$(mktemp)"
+                  trap 'rm -f "$file"' EXIT
+                  bash tools/deploy/infisical-secrets.sh "$file"
+                  export SECRETS_JSON="$(<"$file")"
+                  bash tools/deploy/release-secrets.sh check
+                  release_env="$(bash tools/deploy/release-secrets.sh env ghcr production)"
+                  eval "$release_env"
+                  # SECRETS_JSON holds every name in the Infisical path, and the machine identity is not a release secret.
+                  # Unset both, so the release scripts see only the names in deploy/release-secrets.json.
+                  unset SECRETS_JSON DEPLOY_INFISICAL_CLIENT_ID DEPLOY_INFISICAL_CLIENT_SECRET
+
+                  # release.sh and fleet.py keep release state as GitHub Deployments and read commit statuses in the
+                  # private repository, so they must see it as GITHUB_REPOSITORY. GITHUB_SHA is the ref they give the
+                  # deployments: the tip of its main, which this checkout is. GITHUB_RUN_ID stays this run's own
+                  # numeric ID, which the release uses as the transaction ID.
+                  export GITHUB_REPOSITORY="${GITHUB_REPOSITORY_OWNER}/${PRIVATE_REPOSITORY_NAME}"
+                  GITHUB_SHA="$(git rev-parse HEAD)"
+                  export GITHUB_SHA
+                  bash tools/deploy/ci-release.sh
+
+            - name: Keep the Trivy reports
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: trivy-reports-${{ github.run_id }}
+                  path: ${{ runner.temp }}/trivy-reports
+                  if-no-files-found: ignore
+                  retention-days: 1

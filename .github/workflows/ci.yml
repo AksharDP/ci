@@ -685,7 +685,6 @@ jobs:
                       runner: ubuntu-24.04-arm
         env:
             ARCH: ${{ matrix.arch }}
-            TRIVY_VERSION: v0.70.0
             GHCR_OWNER: ${{ vars.GHCR_OWNER }}
         steps:
             - name: Create the private repository token
@@ -707,7 +706,7 @@ jobs:
                   persist-credentials: false
                   fetch-depth: 1
 
-            - name: Key the dependency images
+            - name: Check the source SHA and the GHCR owner
               shell: bash
               env:
                   SOURCE_SHA: ${{ inputs.source_sha }}
@@ -716,22 +715,6 @@ jobs:
                   [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_sha must be a full commit SHA' >&2; exit 1; }
                   owner="$(printf '%s' "${GHCR_OWNER:-$GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
                   echo "GHCR_OWNER=${owner}" >> "$GITHUB_ENV"
-                  echo "DEPS_HASH=$(bash tools/deploy/deps-hash.sh "$SOURCE_SHA")" >> "$GITHUB_ENV"
-
-            - name: Log in to GHCR
-              shell: bash
-              env:
-                  GHCR_PUSH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
-                  GHCR_PUSH_USERNAME: ${{ vars.GHCR_PUSH_USERNAME }}
-              run: printf '%s' "$GHCR_PUSH_TOKEN" | docker login ghcr.io --username "$GHCR_PUSH_USERNAME" --password-stdin
-
-            - name: Install Trivy
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  curl -sfL --retry 3 --retry-delay 5 \
-                      "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" \
-                      | sudo sh -s -- -b /usr/local/bin "$TRIVY_VERSION"
 
             - name: Key the Trivy database cache
               id: trivy-key
@@ -746,44 +729,18 @@ jobs:
                   path: ~/.cache/trivy
                   key: trivy-db-v1-${{ steps.trivy-key.outputs.key }}
 
+            # tools/deploy/build-deps.sh installs Trivy, logs in to GHCR and builds and scans both images, the same
+            # script the release's dependency job runs. It reads and writes ~/.cache/trivy, restored above.
             - name: Build, check and scan the dependency images
               timeout-minutes: 100
               shell: bash
+              env:
+                  GHCR_USERNAME: ${{ vars.GHCR_PUSH_USERNAME }}
+                  GHCR_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+                  DEPLOY_SHA: ${{ inputs.source_sha }}
               run: |
                   set -euo pipefail
-                  docker buildx create --name fcbe --driver docker-container --use
-                  # The two builds run concurrently, so the vulnerability DB is downloaded once here and each
-                  # build reads it through a symlink with --skip-db-update. Each build has its own fanal cache.
-                  cache="$HOME/.cache/trivy"
-                  trivy image --download-db-only --cache-dir "$cache" --no-progress >/dev/null
-                  build() {
-                      local name="$1" app="$2" dockerfile ref scan_cache
-                      ref="ghcr.io/${GHCR_OWNER}/${name}-deps:${DEPS_HASH}-${ARCH}"
-                      scan_cache="$HOME/.cache/trivy-${name}"
-                      mkdir -p "$scan_cache" && ln -sfn "$cache/db" "$scan_cache/db"
-                      if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
-                          echo "${ref} already exists"
-                          return 0
-                      fi
-                      dockerfile="$RUNNER_TEMP/${name}.Dockerfile"
-                      python3 tools/deploy/deps-dockerfile.py "apps/${app}/Dockerfile" "$app" > "$dockerfile"
-                      trivy config --cache-dir "$scan_cache" --severity CRITICAL,HIGH --exit-code 1 "$dockerfile"
-                      docker buildx build --file "$dockerfile" --target deps --platform "linux/${ARCH}" \
-                          --provenance=false --push --tag "$ref" \
-                          --cache-from "type=registry,ref=ghcr.io/${GHCR_OWNER}/${name}-deps:buildcache-${ARCH}" \
-                          --cache-to "type=registry,ref=ghcr.io/${GHCR_OWNER}/${name}-deps:buildcache-${ARCH},mode=max,compression=zstd,oci-mediatypes=true,image-manifest=true" .
-                      [ "$(docker run --rm --entrypoint id "$ref" -u)" = 1000 ] || { echo "${ref}: bun is not uid 1000" >&2; return 1; }
-                      trivy image --cache-dir "$scan_cache" --skip-db-update --pkg-types os,library --severity CRITICAL,HIGH \
-                          --exit-code 1 --ignore-unfixed "$ref"
-                  }
-                  build filecube-api api &
-                  api=$!
-                  build filecube-background-worker background-worker &
-                  bg=$!
-                  status=0
-                  wait "$api" || status=1
-                  wait "$bg" || status=1
-                  exit "$status"
+                  bash tools/deploy/build-deps.sh "$ARCH"
 
     # Posts the statuses to the private commit. The private repository's collect job waits for this
     # run to finish, so the artifacts above exist by then.
