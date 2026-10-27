@@ -12,9 +12,9 @@ on:
     workflow_dispatch:
         inputs:
             mode:
-                description: ci validates and reports statuses; deps builds the dependency images for a release
+                description: ci validates and reports statuses; deps builds the dependency images for a release; latency compares the API latency of two commits and reports no statuses
                 type: choice
-                options: [ci, deps]
+                options: [ci, deps, latency]
                 default: ci
             source_sha:
                 description: Full commit SHA in the private repository
@@ -76,6 +76,16 @@ on:
                 type: choice
                 options: ['0', '25', '50', '100']
                 default: '25'
+            latency_base_sha:
+                description: Latency mode only. Full commit SHA of the base, in the private repository
+                required: false
+                type: string
+                default: ''
+            latency_head_sha:
+                description: Latency mode only. Full commit SHA of the head, in the private repository
+                required: false
+                type: string
+                default: ''
 
 run-name: CI ${{ inputs.request_id }}
 
@@ -663,6 +673,128 @@ jobs:
               with:
                   name: scale-benchmark-reports
                   path: ${{ runner.temp }}/artifacts
+                  if-no-files-found: ignore
+                  retention-days: 1
+
+    # Compares the API latency of two commits on one runner. The private checkout holds the harness; each commit is
+    # checked out beside it and runs against a copy of the same seeded fixture. Reports no statuses.
+    latency:
+        name: API latency comparison
+        if: inputs.mode == 'latency'
+        runs-on: ubuntu-24.04
+        timeout-minutes: 180
+        permissions:
+            contents: read
+        steps:
+            - name: Check the compared commits
+              shell: bash
+              env:
+                  SOURCE_SHA: ${{ inputs.source_sha }}
+                  BASE_SHA: ${{ inputs.latency_base_sha }}
+                  HEAD_SHA: ${{ inputs.latency_head_sha }}
+              run: |
+                  set -euo pipefail
+                  for sha in "$SOURCE_SHA" "$BASE_SHA" "$HEAD_SHA"; do
+                      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'latency mode needs full commit SHAs in source_sha, latency_base_sha and latency_head_sha' >&2; exit 1; }
+                  done
+
+            - name: Create the private repository token
+              id: private
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+              with:
+                  client-id: ${{ vars.PRIVATE_READER_CLIENT_ID }}
+                  private-key: ${{ secrets.PRIVATE_READER_PRIVATE_KEY }}
+                  owner: ${{ github.repository_owner }}
+                  repositories: ${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  permission-contents: read
+
+            - name: Check out the private source
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  repository: ${{ github.repository_owner }}/${{ vars.PRIVATE_REPOSITORY_NAME }}
+                  ref: ${{ inputs.source_sha }}
+                  token: ${{ steps.private.outputs.token }}
+                  persist-credentials: false
+                  fetch-depth: 0
+
+            - name: Set up Bun
+              uses: ./.github/actions/setup-bun
+              with:
+                  install-filters: '[]'
+
+            - name: Start PostgreSQL 18 and Valkey 8.0
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  docker run --detach --name postgres --publish 127.0.0.1:5432:5432 \
+                      --env POSTGRES_USER=fcbe --env POSTGRES_PASSWORD=fcbe \
+                      --env POSTGRES_DB=postgres postgres:18 >/dev/null
+                  docker run --detach --name valkey --publish 127.0.0.1:6379:6379 valkey/valkey:8.0 >/dev/null
+                  wait_ready() {
+                      local name="$1" check="$2"
+                      for attempt in $(seq 1 30); do
+                          eval "$check" && return 0
+                          sleep 2
+                      done
+                      docker logs "$name" >&2
+                      return 1
+                  }
+                  wait_ready postgres 'docker exec postgres pg_isready -U fcbe -d postgres' & pg_pid=$!
+                  wait_ready valkey 'docker exec valkey valkey-cli ping' & vk_pid=$!
+                  wait $pg_pid || exit 1
+                  wait $vk_pid || exit 1
+
+            - name: Check out the compared commits
+              shell: bash
+              env:
+                  BASE_SHA: ${{ inputs.latency_base_sha }}
+                  HEAD_SHA: ${{ inputs.latency_head_sha }}
+              run: |
+                  set -euo pipefail
+                  git worktree add --detach "$RUNNER_TEMP/latency/base" "$BASE_SHA"
+                  git worktree add --detach "$RUNNER_TEMP/latency/head" "$HEAD_SHA"
+
+            - name: Install the dependencies of each commit
+              timeout-minutes: 20
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  for tree in base head; do
+                      (cd "$RUNNER_TEMP/latency/$tree" && bun install --frozen-lockfile --network-concurrency=8)
+                  done
+
+            - name: Seed the PostgreSQL fixture
+              timeout-minutes: 60
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  export BUN_PERF_POSTGRES_URL=postgresql://fcbe:fcbe@127.0.0.1:5432/postgres
+                  export DATABASE_SSL=false
+                  (cd "$RUNNER_TEMP/latency/base" && bun tools/database/seed-local-scale-perf.ts --run --smoke) \
+                      | tee "$RUNNER_TEMP/latency-seed.log"
+                  database="$(jq -Rr 'fromjson? | select(type == "object" and .database) | .database' "$RUNNER_TEMP/latency-seed.log" | tail -n 1)"
+                  [ -n "$database" ] || { echo 'Seed output did not include the fixture database name' >&2; exit 1; }
+                  echo "LATENCY_FIXTURE_DB=${database}" >> "$GITHUB_ENV"
+
+            - name: Compare the two commits
+              timeout-minutes: 150
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  bun tools/perf/latency/run.ts \
+                      --base "$RUNNER_TEMP/latency/base" \
+                      --head "$RUNNER_TEMP/latency/head" \
+                      --postgres-url postgresql://fcbe:fcbe@127.0.0.1:5432/postgres \
+                      --fixture "$LATENCY_FIXTURE_DB" \
+                      --out "$RUNNER_TEMP/latency-results" \
+                      --rounds 2
+
+            - name: Keep the latency results
+              if: always()
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: latency-results
+                  path: ${{ runner.temp }}/latency-results
                   if-no-files-found: ignore
                   retention-days: 1
 
